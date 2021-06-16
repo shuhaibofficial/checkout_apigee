@@ -1,0 +1,214 @@
+<?php
+
+
+
+use Drupal\apigee_m10n\Entity\PurchasedPlanInterface;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\StringTranslation\TranslatableMarkup;
+use Symfony\Component\HttpFoundation\RedirectResponse;
+use Drupal\Core\Url;
+use Apigee\Edge\Api\Monetization\Entity\LegalEntityInterface;
+use Apigee\Edge\Exception\ClientErrorException;
+use Drupal\apigee_edge\Entity\ApiProductInterface;
+use Drupal\apigee_edge\Entity\Developer;
+use Drupal\apigee_edge\Entity\Form\FieldableEdgeEntityForm;
+use Drupal\apigee_m10n\Form\PrepaidBalanceConfigForm;
+use Drupal\apigee_m10n\MonetizationInterface;
+use Drupal\Core\Cache\Cache;
+use Drupal\Core\Config\ConfigFactoryInterface;
+use Drupal\Core\Extension\ModuleHandlerInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Messenger\MessengerInterface;
+use Drupal\Core\Routing\RouteMatchInterface;
+use Drupal\Core\Session\AccountInterface;
+use Symfony\Component\DependencyInjection\ContainerInterface;
+use Drupal\commerce_order\Entity\OrderInterface;
+use Drupal\commerce_price\Price;
+use Drupal\commerce_order\Entity\OrderItem;
+use Drupal\commerce_order\Entity\Order;
+use Drupal\commerce_store\Entity\Store;
+use Drupal\commerce_store\Entity\StoreInterface;
+/**
+ * @file
+ * Hooks for apigee_m10n module.
+ */
+
+/**
+ * @addtogroup hooks
+ * @{
+ */
+
+
+
+/**
+ * Alters the insufficient balance error message.
+ *
+ * @param \Drupal\Core\StringTranslation\TranslatableMarkup $message
+ *   A translatable error message.
+ * @param \Drupal\apigee_m10n\Entity\PurchasedPlanInterface $purchased_plan
+ *   The failed purchased plan.
+ *
+ * @see \Drupal\apigee_m10n\Entity\Form\PurchasedPlanForm::save()
+ */
+function checkout_apigee_apigee_m10n_insufficient_balance_error_message_alter(TranslatableMarkup &$message, PurchasedPlanInterface $purchased_plan) {
+	//1.Plan Details and SetupFess and if needed Advance fees
+	$rate_plan = $purchased_plan->getRatePlan();
+	$min_balance_needed = $rate_plan->isAdvance() ? $rate_plan->getSetUpFee() + $rate_plan->getRecurringFee() : $rate_plan->getSetUpFee();//
+	$currency_id = $rate_plan->getCurrency()->id();
+
+
+
+	//2. User Details
+	$user = $purchased_plan->getOwner();
+
+	//3. Load the Apigee Developer
+	/* @var \Drupal\apigee_m10n\ApigeeSdkControllerFactory $sdk */
+    $sdk = \Drupal::service('apigee_m10n.sdk_controller_factory');
+    try {
+      $developer = $sdk->developerController()->load($user->getEmail());
+    }
+    catch (\Exception $e) {
+      $developer = NULL;
+    }
+    // If developer is prepaid, check for sufficient balance to purchase to the
+
+	/**
+   * Apigee Monetization utility service.
+   *
+   * @var \Drupal\apigee_m10n\MonetizationInterface
+   */
+	//4.Load Prepaid Developer Balance
+	$monetization = \Drupal::service('apigee_m10n.monetization');
+	        /** @var \Apigee\Edge\Api\Monetization\Entity\SupportedCurrencyInterface[] $supported_currencies */
+  $supported_currencies = \Drupal::service('apigee_m10n.monetization')->getSupportedCurrencies();
+
+    if ($developer && $developer->getBillingType() == LegalEntityInterface::BILLING_TYPE_PREPAID) {
+      $prepaid_balances = [];
+      foreach ($monetization->getDeveloperPrepaidBalances($user, new \DateTimeImmutable('now')) as $prepaid_balance) {
+        $prepaid_balances[$prepaid_balance->getCurrency()->id()] = $prepaid_balance->getCurrentBalance();
+      }
+	}
+    else{
+      $message = "Unable Load Developer Balance Or PostPaid DEV";
+      return $message;
+    }
+	//Actual Developer Balance
+	$prepaid_balances[$currency_id] = $prepaid_balances[$currency_id] ?? 0;
+
+  $balance_difference = 0;
+	if ($min_balance_needed > $prepaid_balances[$currency_id]) {
+		//$balance_difference is diff b/w Rate plan AMount - Prepaid Balance of developer
+		$balance_difference = $min_balance_needed - $prepaid_balances[$currency_id];
+		$supported_currency = $supported_currencies[$currency_id];
+		$minimum_top_up_amount = $supported_currency->getMinimumTopUpAmount();
+		if($balance_difference < $minimum_top_up_amount){
+			$balance_difference = $minimum_top_up_amount;
+		}
+		//$message = 'MInimum Balalnces Needed :'.$min_balance_needed.', AND Your Balance :'.$prepaid_balances[$currency_id].'AND Difference is :'.$balance_difference;
+	}
+	if($balance_difference>0) {
+    $order = makeCommerceCart($purchased_plan, $balance_difference);
+  }
+	else{
+    $message = "Purchase Value Zero or Below";
+    return "";
+  }
+	//Redirect
+	$message = 'hi'.$prepaid_balances[$currency_id];
+ 	$url = \Drupal\Core\Url::fromRoute('commerce_cart.page')->toString();
+	$response = new RedirectResponse($url,301);
+	$response->send();
+	return "";
+/* 	$response = new RedirectResponse(Url::fromRoute('commerce_checkout.form',[
+        'commerce_order' => $order->id(),
+        'step' => 'payment',
+      ])->toString());
+	 $response->send(); */
+
+}
+
+function makeCommerceCart(PurchasedPlanInterface $purchased_plan ,float  $cart_value){
+	$store_id = 1; 					// Can be Dynamic or Load From a Config
+	$order_type = 'default'; 		// by it will be default
+	$entity_manager = \Drupal::entityTypeManager();
+	$cart_manager = \Drupal::service('commerce_cart.cart_manager');
+	$cart_provider = \Drupal::service('commerce_cart.cart_provider');
+	  // Drupal\commerce_store\Entity\Store::load($store_id);
+	$store = $entity_manager->getStorage('commerce_store')->load($store_id);
+     // Load Product Varaince
+	 // Note ::: Here is The product Load Depend Upon product  type ='add_credit_type'
+	$product = $entity_manager->getStorage('commerce_product')->loadByProperties(['type' => 'custom_apigee']);
+	$product_object = array_values($product)[0];
+
+
+	$variations = $product_object->getVariations();
+	$variation_object =  array_values($variations)[0];
+
+		//Create Order LIne Item for custom values for order like title and price override
+ 	$order_item=OrderItem::create([
+      'type' => 'default',
+      'purchased_entity' => $variation_object ,//(string)$product_variation,
+      'quantity' => 1,
+      'title' => 'Prepaid' ,//$productVariation->get('title')->value, // apigee plan name or something used
+      // Omit these lines to preserve original product price. getting data from apigee raw
+      'unit_price' => new Price($cart_value, 'SAR'),
+      'overridden_unit_price' => TRUE,
+    ]);
+
+    $order_item->save();
+    $order_item->setTitle("PREPAID_CHECKOUTS");
+    //$order_item->c
+
+
+	$order = createOrder($order_item,$purchased_plan,$store);
+
+/* 	//load cart if exist
+	$cart = $cart_provider->getCart($order_type, $store);
+	if (!$cart) {
+	  // if not create one
+    $cart = $cart_provider->createCart($order_type, $store);
+		}
+	else	{
+   $cart_manager->addOrderItem($cart, $order_item);
+		} */
+   return $order;
+
+
+
+
+
+
+}
+
+
+
+ function createOrder(OrderItem $orderItem,PurchasedPlanInterface $purchased_plan, StoreInterface $store)
+  {
+
+	  $user = $purchased_plan->getOwner();
+
+	  $order = Order::create([
+      'type' => 'default',
+      'mail' => $user->getEmail(),
+      'uid' => $user->id(),
+      'store_id' => $store,
+      'order_items' => [$orderItem],
+      'placed' => \Drupal::time()->getCurrentTime(),
+    ]);
+	$order->save();
+	$rate_plan_name = $purchased_plan->getRatePlan()->getDisplayName();
+	$rate_plan_id = $purchased_plan->getRatePlan()->id();
+	$product_bundle = $purchased_plan->getRatePlan()->getProductBundleId();
+    $order->setData('rate_plan_name', $rate_plan_name);
+    $order->setData('rate_plan_id', $rate_plan_id);
+	$order->setData('product_bundle',$product_bundle);
+	$order->save();
+	return $order;
+  }
+
+
+
+
+/**
+ * @} End of "addtogroup hooks".
+ */
